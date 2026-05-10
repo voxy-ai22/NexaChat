@@ -41,7 +41,7 @@ async function initDb() {
         email VARCHAR(100) UNIQUE NOT NULL,
         password TEXT NOT NULL,
         avatar_url TEXT,
-        status_message TEXT DEFAULT 'Streaming thoughts...',
+        status_message TEXT DEFAULT 'Hey there! I am using Nexa.',
         is_online BOOLEAN DEFAULT FALSE,
         last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -73,6 +73,7 @@ async function initDb() {
       CREATE TABLE IF NOT EXISTS stickers (
         id SERIAL PRIMARY KEY,
         url TEXT NOT NULL,
+        name VARCHAR(100),
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -86,7 +87,6 @@ async function initDb() {
 }
 
 // Scheduled Task: Cleanup at 7 AM
-// '0 7 * * *' runs at minute 0, hour 7 every day
 cron.schedule('0 7 * * *', async () => {
   console.log("Running scheduled cleanup at 7 AM...");
   try {
@@ -109,89 +109,160 @@ async function startServer() {
 
   // Uploads setup
   const uploadDir = path.join(__dirname, 'uploads');
-  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
   app.use('/uploads', express.static(uploadDir));
 
   const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+    filename: (req, file, cb) => {
+      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+      cb(null, Date.now() + '-' + safeName);
+    }
   });
-  const upload = multer({ storage });
+  const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB limit
 
   // Auth Middleware
   const authenticateToken = (req: any, res: any, next: any) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.sendStatus(401);
+    if (!token) return res.status(401).json({ error: 'No token provided' });
 
     jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-      if (err) return res.sendStatus(403);
+      if (err) return res.status(403).json({ error: 'Invalid token' });
       req.user = user;
       next();
     });
   };
 
-  // --- API Routes ---
+  // ─── API Routes ──────────────────────────────────────────────────
 
-  // Auth
+  // Auth - Register
   app.post('/api/auth/register', async (req, res) => {
     const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: 'Username, email, and password are required' });
+    }
+    if (username.length < 3) {
+      return res.status(400).json({ error: 'Username must be at least 3 characters' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
       const result = await pool.query(
-        'INSERT INTO users (username, email, password) VALUES ($1, $2, $3) RETURNING id, username, email',
-        [username, email, hashedPassword]
+        'INSERT INTO users (username, email, password) VALUES ($1, $2, $3) RETURNING id, username, email, status_message, avatar_url, created_at',
+        [username.trim(), email.trim().toLowerCase(), hashedPassword]
       );
       const user = result.rows[0];
-      const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
+      const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
       res.json({ user, token });
     } catch (err: any) {
       if (err.code === '23505') {
-        return res.status(400).json({ error: 'Username or email already exists' });
+        // Unique violation - check which field
+        if (err.detail?.includes('email')) {
+          return res.status(400).json({ error: 'Email already registered' });
+        }
+        return res.status(400).json({ error: 'Username already taken' });
       }
-      res.status(500).json({ error: 'Registration failed' });
+      console.error('Register error:', err);
+      res.status(500).json({ error: 'Registration failed. Please try again.' });
     }
   });
 
+  // Auth - Login
   app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
     try {
-      const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+      const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.trim().toLowerCase()]);
       const user = result.rows[0];
-      if (!user || !(await bcrypt.compare(password, user.password))) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+
+      if (!user) {
+        return res.status(401).json({ error: 'No account found with this email' });
       }
-      const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
-      res.json({ 
-        user: { 
-          id: user.id, 
-          username: user.username, 
-          email: user.email, 
+
+      const passwordMatch = await bcrypt.compare(password, user.password);
+      if (!passwordMatch) {
+        return res.status(401).json({ error: 'Incorrect password' });
+      }
+
+      const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+      res.json({
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
           avatar_url: user.avatar_url,
           status_message: user.status_message,
           created_at: user.created_at
-        }, 
-        token 
+        },
+        token
       });
     } catch (err) {
-      res.status(500).json({ error: 'Login failed' });
+      console.error('Login error:', err);
+      res.status(500).json({ error: 'Login failed. Please try again.' });
     }
   });
 
-  // User Profiles
-  app.get('/api/users/:userId', async (req, res) => {
+  // ─── IMPORTANT: Specific routes BEFORE parameterized routes ──────
+
+  // Users - Online list (MUST be before /api/users/:userId)
+  app.get('/api/users/online', async (req, res) => {
     try {
       const result = await pool.query(
-        'SELECT id, username, email, avatar_url, status_message, created_at, is_online, last_active FROM users WHERE id = $1',
-        [req.params.userId]
+        'SELECT id, username, avatar_url, status_message, is_online FROM users WHERE is_online = true ORDER BY username ASC'
       );
-      if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-      res.json(result.rows[0]);
+      res.json(result.rows);
     } catch (err) {
-      res.status(500).json({ error: 'Failed to fetch user' });
+      console.error('Online users error:', err);
+      res.status(500).json({ error: 'Failed to fetch online users' });
     }
   });
 
+  // Users - Update profile (username + status) - MUST be before /api/users/:userId
+  app.patch('/api/users/profile', authenticateToken, async (req: any, res) => {
+    const { username, status } = req.body;
+    try {
+      const updates: string[] = [];
+      const values: any[] = [];
+      let idx = 1;
+
+      if (username && username.trim()) {
+        updates.push(`username = $${idx++}`);
+        values.push(username.trim());
+      }
+      if (status !== undefined) {
+        updates.push(`status_message = $${idx++}`);
+        values.push(status);
+      }
+
+      if (updates.length === 0) {
+        return res.status(400).json({ error: 'Nothing to update' });
+      }
+
+      values.push(req.user.id);
+      const result = await pool.query(
+        `UPDATE users SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, username, email, status_message, avatar_url`,
+        values
+      );
+      res.json({ success: true, user: result.rows[0] });
+    } catch (err: any) {
+      if (err.code === '23505') {
+        return res.status(400).json({ error: 'Username already taken' });
+      }
+      console.error('Profile update error:', err);
+      res.status(500).json({ error: 'Failed to update profile' });
+    }
+  });
+
+  // Users - Update status only
   app.patch('/api/users/status', authenticateToken, async (req: any, res) => {
     const { status } = req.body;
     try {
@@ -199,136 +270,86 @@ async function startServer() {
       io.emit('status_update', { userId: req.user.id, status });
       res.json({ success: true });
     } catch (err) {
+      console.error('Status update error:', err);
       res.status(500).json({ error: 'Failed to update status' });
     }
   });
 
-  app.patch('/api/users/profile', authenticateToken, async (req: any, res) => {
-    const { username } = req.body;
+  // Users - Get by ID (parameterized - AFTER specific routes)
+  app.get('/api/users/:userId', async (req, res) => {
+    const userId = parseInt(req.params.userId);
+    if (isNaN(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
     try {
-      await pool.query('UPDATE users SET username = $1 WHERE id = $2', [username, req.user.id]);
-      res.json({ success: true, username });
-    } catch (err: any) {
-      if (err.code === '23505') {
-        return res.status(400).json({ error: 'Username already exists' });
-      }
-      res.status(500).json({ error: 'Failed to update profile' });
+      const result = await pool.query(
+        'SELECT id, username, email, avatar_url, status_message, created_at, is_online, last_active FROM users WHERE id = $1',
+        [userId]
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+      res.json(result.rows[0]);
+    } catch (err) {
+      console.error('Get user error:', err);
+      res.status(500).json({ error: 'Failed to fetch user' });
     }
   });
 
-  // Media Uploads
+  // Media Upload
   app.post('/api/media/upload', authenticateToken, upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const url = `/uploads/${req.file.filename}`;
-    res.json({ url });
+    res.json({ url, filename: req.file.filename, size: req.file.size });
   });
 
-  // Stickers
+  // Stickers - Get all
   app.get('/api/stickers', async (req, res) => {
     try {
       const result = await pool.query('SELECT * FROM stickers ORDER BY created_at DESC');
       res.json(result.rows);
     } catch (err) {
+      console.error('Stickers error:', err);
       res.status(500).json({ error: 'Failed to fetch stickers' });
     }
   });
 
+  // Stickers - Create
   app.post('/api/stickers', authenticateToken, upload.single('file'), async (req: any, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const url = `/uploads/${req.file.filename}`;
+    const name = req.body.name || req.file.originalname.split('.')[0];
     try {
       const result = await pool.query(
-        'INSERT INTO stickers (url, user_id) VALUES ($1, $2) RETURNING *',
-        [url, req.user.id]
+        'INSERT INTO stickers (url, name, user_id) VALUES ($1, $2, $3) RETURNING *',
+        [url, name, req.user.id]
       );
       res.json(result.rows[0]);
     } catch (err) {
+      console.error('Sticker create error:', err);
       res.status(500).json({ error: 'Failed to create sticker' });
     }
   });
 
-  // --- Socket.io ---
-
-  const users = new Map(); // userId -> socketId
-
-  io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
-
-    socket.on('identify', async ({ userId }) => {
-      users.set(userId, socket.id);
-      await pool.query('UPDATE users SET is_online = true, last_active = CURRENT_TIMESTAMP WHERE id = $1', [userId]);
-      io.emit('presence_update', { userId, isOnline: true });
-    });
-
-    socket.on('send_message', async (data) => {
-      const { content, type, senderId, parentId, mediaUrl, fileName, fileSize, viewOnce, duration } = data;
-      try {
-        const result = await pool.query(
-          `INSERT INTO messages (content, type, sender_id, parent_id, media_url, file_name, file_size, view_once, duration) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-          [content, type, senderId, parentId, mediaUrl, fileName, fileSize, viewOnce, duration]
-        );
-        const newMessage = result.rows[0];
-        
-        // Get sender info
-        const senderResult = await pool.query('SELECT username FROM users WHERE id = $1', [senderId]);
-        newMessage.senderUsername = senderResult.rows[0].username;
-
-        io.emit('new_message', newMessage);
-      } catch (err) {
-        console.error('Failed to save message:', err);
-      }
-    });
-
-    socket.on('add_reaction', async ({ messageId, userId, emoji }) => {
-      try {
-        await pool.query(
-          'INSERT INTO reactions (message_id, user_id, emoji) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-          [messageId, userId, emoji]
-        );
-        io.emit('reaction_update', { messageId, userId, emoji });
-      } catch (err) {
-        console.error('Failed to add reaction:', err);
-      }
-    });
-
-    socket.on('typing', ({ userId, username, isTyping }) => {
-      socket.broadcast.emit('user_typing', { userId, username, isTyping });
-    });
-
-    socket.on('disconnect', async () => {
-      let disconnectedUserId = null;
-      for (const [userId, socketId] of users.entries()) {
-        if (socketId === socket.id) {
-          disconnectedUserId = userId;
-          users.delete(userId);
-          break;
-        }
-      }
-
-      if (disconnectedUserId) {
-        await pool.query('UPDATE users SET is_online = false, last_active = CURRENT_TIMESTAMP WHERE id = $1', [disconnectedUserId]);
-        io.emit('presence_update', { userId: disconnectedUserId, isOnline: false });
-      }
-      console.log('User disconnected:', socket.id);
-    });
-  });
-
-  // History Route
+  // Messages - Get history with reactions
   app.get('/api/messages', async (req, res) => {
     try {
       const result = await pool.query(`
-        SELECT m.*, u.username as "senderUsername"
+        SELECT 
+          m.*,
+          u.username as "senderUsername",
+          pm.content as "parentContent",
+          pu.username as "parentSenderUsername"
         FROM messages m
         JOIN users u ON m.sender_id = u.id
+        LEFT JOIN messages pm ON m.parent_id = pm.id
+        LEFT JOIN users pu ON pm.sender_id = pu.id
+        WHERE m.is_deleted = FALSE
         ORDER BY m.created_at ASC
-        LIMIT 100
+        LIMIT 200
       `);
-      
+
       const messages = result.rows;
-      
-      // Get reactions for these messages
       const messageIds = messages.map(m => m.id);
+
       if (messageIds.length > 0) {
         const reactionsResult = await pool.query(
           'SELECT * FROM reactions WHERE message_id = ANY($1)',
@@ -341,27 +362,116 @@ async function startServer() {
           return acc;
         }, {} as any);
 
-        messages.forEach(m => {
-          m.reactions = reactionsMap[m.id] || {};
-        });
+        messages.forEach(m => { m.reactions = reactionsMap[m.id] || {}; });
       }
 
       res.json(messages);
     } catch (err) {
+      console.error('Messages error:', err);
       res.status(500).json({ error: 'Failed to fetch messages' });
     }
   });
 
-  app.get('/api/users/online', async (req, res) => {
-    try {
-      const result = await pool.query('SELECT id, username, avatar_url, is_online FROM users WHERE is_online = true');
-      res.json(result.rows);
-    } catch (err) {
-      res.status(500).json({ error: 'Failed to fetch online users' });
-    }
+  // ─── Socket.io ───────────────────────────────────────────────────
+
+  const connectedUsers = new Map<number, string>(); // userId -> socketId
+
+  io.on('connection', (socket) => {
+    console.log('Socket connected:', socket.id);
+
+    socket.on('identify', async ({ userId }) => {
+      connectedUsers.set(userId, socket.id);
+      try {
+        await pool.query(
+          'UPDATE users SET is_online = true, last_active = CURRENT_TIMESTAMP WHERE id = $1',
+          [userId]
+        );
+        // Emit updated online users list
+        const onlineResult = await pool.query(
+          'SELECT id, username, avatar_url, status_message, is_online FROM users WHERE is_online = true'
+        );
+        io.emit('online_users', onlineResult.rows);
+        io.emit('presence_update', { userId, isOnline: true });
+      } catch (err) {
+        console.error('Identify error:', err);
+      }
+    });
+
+    socket.on('send_message', async (data) => {
+      const { content, type, senderId, parentId, mediaUrl, fileName, fileSize, viewOnce, duration } = data;
+      try {
+        const result = await pool.query(
+          `INSERT INTO messages (content, type, sender_id, parent_id, media_url, file_name, file_size, view_once, duration)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+          [content || null, type, senderId, parentId || null, mediaUrl || null, fileName || null, fileSize || null, viewOnce || false, duration || null]
+        );
+        const newMessage = result.rows[0];
+
+        // Get sender username
+        const senderResult = await pool.query('SELECT username FROM users WHERE id = $1', [senderId]);
+        newMessage.senderUsername = senderResult.rows[0]?.username || 'Unknown';
+        newMessage.reactions = {};
+
+        // If replying, get parent info
+        if (parentId) {
+          const parentResult = await pool.query(
+            'SELECT m.content, u.username FROM messages m JOIN users u ON m.sender_id = u.id WHERE m.id = $1',
+            [parentId]
+          );
+          if (parentResult.rows[0]) {
+            newMessage.parentContent = parentResult.rows[0].content;
+            newMessage.parentSenderUsername = parentResult.rows[0].username;
+          }
+        }
+
+        io.emit('new_message', newMessage);
+      } catch (err) {
+        console.error('Send message error:', err);
+      }
+    });
+
+    socket.on('add_reaction', async ({ messageId, userId, emoji }) => {
+      try {
+        await pool.query(
+          'INSERT INTO reactions (message_id, user_id, emoji) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+          [messageId, userId, emoji]
+        );
+        io.emit('reaction_update', { messageId, userId, emoji });
+      } catch (err) {
+        console.error('Reaction error:', err);
+      }
+    });
+
+    socket.on('typing', ({ userId, username, isTyping }) => {
+      socket.broadcast.emit('user_typing', { userId, username, isTyping });
+    });
+
+    socket.on('disconnect', async () => {
+      let disconnectedUserId: number | null = null;
+      for (const [userId, socketId] of connectedUsers.entries()) {
+        if (socketId === socket.id) {
+          disconnectedUserId = userId;
+          connectedUsers.delete(userId);
+          break;
+        }
+      }
+      if (disconnectedUserId) {
+        try {
+          await pool.query(
+            'UPDATE users SET is_online = false, last_active = CURRENT_TIMESTAMP WHERE id = $1',
+            [disconnectedUserId]
+          );
+          io.emit('presence_update', { userId: disconnectedUserId, isOnline: false });
+        } catch (err) {
+          console.error('Disconnect error:', err);
+        }
+      }
+      console.log('Socket disconnected:', socket.id);
+    });
   });
 
-  // Vite Integration
+  // ─── Vite / Static ───────────────────────────────────────────────
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -376,7 +486,7 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || '3000');
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
     initDb();
