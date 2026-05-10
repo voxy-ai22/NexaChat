@@ -1,0 +1,6 @@
+{
+  "name": "Nexa Global",
+  "description": "A feature-rich global chat application with media sharing, view-once media, emoji reactions, and real-time presence.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["realtime_chat", "file_storage", "voice_notes"]
+}
